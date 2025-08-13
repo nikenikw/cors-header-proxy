@@ -1,150 +1,86 @@
+export interface Env {
+  ALLOW_ORIGIN: string,   // 允許的前端網域（例如 https://blog.familyds.com）
+  ALLOWED_HOSTS: string,  // 允許轉發的上游主機（預設 app.overlays.uno）
+  AUTH_TOKEN?: string     // （可選）前端自訂驗證 token
+}
+
+const CORS = (origin: string) => ({
+  "Access-Control-Allow-Origin": origin,
+  "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Proxy-Token",
+});
+
 export default {
-	async fetch(request): Promise<Response> {
-		const corsHeaders = {
-			"Access-Control-Allow-Origin": "*",
-			"Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-			"Access-Control-Max-Age": "86400",
-		};
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// The URL for the remote third party API you want to fetch from
-		// but does not implement CORS
-		const API_URL = "https://examples.cloudflareworkers.com/demos/demoapi";
+    // 預檢請求
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS(env.ALLOW_ORIGIN || "*") });
+    }
 
-		// The endpoint you want the CORS reverse proxy to be on
-		const PROXY_ENDPOINT = "/corsproxy/";
+    // 只開放一個路徑
+    if (url.pathname !== "/overlay-proxy") {
+      return new Response("Not found", { status: 404 });
+    }
 
-		// The rest of this snippet for the demo page
-		function rawHtmlResponse(html) {
-			return new Response(html, {
-				headers: {
-					"content-type": "text/html;charset=UTF-8",
-				},
-			});
-		}
+    // （可選）驗證自訂 token，避免被濫用
+    if (env.AUTH_TOKEN) {
+      const got = request.headers.get("X-Proxy-Token");
+      if (got !== env.AUTH_TOKEN) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...CORS(env.ALLOW_ORIGIN || "*") },
+        });
+      }
+    }
 
-		const DEMO_PAGE = `
-      <!DOCTYPE html>
-      <html>
-      <body>
-        <h1>API GET without CORS Proxy</h1>
-        <a target="_blank" href="https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#Checking_that_the_fetch_was_successful">Shows TypeError: Failed to fetch since CORS is misconfigured</a>
-        <p id="noproxy-status"/>
-        <code id="noproxy">Waiting</code>
-        <h1>API GET with CORS Proxy</h1>
-        <p id="proxy-status"/>
-        <code id="proxy">Waiting</code>
-        <h1>API POST with CORS Proxy + Preflight</h1>
-        <p id="proxypreflight-status"/>
-        <code id="proxypreflight">Waiting</code>
-        <script>
-        let reqs = {};
-        reqs.noproxy = () => {
-          return fetch("${API_URL}").then(r => r.json())
-        }
-        reqs.proxy = async () => {
-          let href = "${PROXY_ENDPOINT}?apiurl=${API_URL}"
-          return fetch(window.location.origin + href).then(r => r.json())
-        }
-        reqs.proxypreflight = async () => {
-          let href = "${PROXY_ENDPOINT}?apiurl=${API_URL}"
-          let response = await fetch(window.location.origin + href, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              msg: "Hello world!"
-            })
-          })
-          return response.json()
-        }
-        (async () => {
-        for (const [reqName, req] of Object.entries(reqs)) {
-          try {
-            let data = await req()
-            document.getElementById(reqName).textContent = JSON.stringify(data)
-          } catch (e) {
-            document.getElementById(reqName).textContent = e
-          }
-        }
-      })()
-        </script>
-      </body>
-      </html>
-    `;
+    // 讀 ?u= 目標 URL（必填）
+    const target = url.searchParams.get("u");
+    if (!target) {
+      return new Response(JSON.stringify({ error: 'Missing "u" query param' }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", ...CORS(env.ALLOW_ORIGIN || "*") },
+      });
+    }
 
-		async function handleRequest(request) {
-			const url = new URL(request.url);
-			let apiUrl = url.searchParams.get("apiurl");
+    // 限制只允許特定上游主機
+    const upstream = new URL(target);
+    const allowedHosts = (env.ALLOWED_HOSTS || "app.overlays.uno").split(",").map(s => s.trim());
+    if (!allowedHosts.includes(upstream.host)) {
+      return new Response(JSON.stringify({ error: "Host not allowed" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", ...CORS(env.ALLOW_ORIGIN || "*") },
+      });
+    }
 
-			if (apiUrl == null) {
-				apiUrl = API_URL;
-			}
+    // 準備轉發：沿用 method / headers / body
+    const init: RequestInit = {
+      method: request.method,
+      headers: {
+        "Content-Type": request.headers.get("Content-Type") || "application/json",
+      },
+      body: ["GET", "HEAD"].includes(request.method) ? undefined : await request.text(),
+      redirect: "manual",
+    };
 
-			// Rewrite request to point to API URL. This also makes the request mutable
-			// so you can add the correct Origin header to make the API server think
-			// that this request is not cross-site.
-			request = new Request(apiUrl, request);
-			request.headers.set("Origin", new URL(apiUrl).origin);
-			let response = await fetch(request);
-			// Recreate the response so you can modify the headers
+    // 透傳 Authorization（如果你有需要）
+    const auth = request.headers.get("Authorization");
+    if (auth) (init.headers as Record<string, string>)["Authorization"] = auth;
 
-			response = new Response(response.body, response);
-			// Set CORS headers
+    // 送出
+    const resp = await fetch(upstream.toString(), init);
 
-			response.headers.set("Access-Control-Allow-Origin", url.origin);
+    // 取回內容（JSON 或純文字都支援）
+    const contentType = resp.headers.get("content-type") || "application/json";
+    const text = await resp.text();
 
-			// Append to/Add Vary header so browser will cache response correctly
-			response.headers.append("Vary", "Origin");
-
-			return response;
-		}
-
-		async function handleOptions(request) {
-			if (
-				request.headers.get("Origin") !== null &&
-				request.headers.get("Access-Control-Request-Method") !== null &&
-				request.headers.get("Access-Control-Request-Headers") !== null
-			) {
-				// Handle CORS preflight requests.
-				return new Response(null, {
-					headers: {
-						...corsHeaders,
-						"Access-Control-Allow-Headers": request.headers.get(
-							"Access-Control-Request-Headers",
-						),
-					},
-				});
-			} else {
-				// Handle standard OPTIONS request.
-				return new Response(null, {
-					headers: {
-						Allow: "GET, HEAD, POST, OPTIONS",
-					},
-				});
-			}
-		}
-
-		const url = new URL(request.url);
-		if (url.pathname.startsWith(PROXY_ENDPOINT)) {
-			if (request.method === "OPTIONS") {
-				// Handle CORS preflight requests
-				return handleOptions(request);
-			} else if (
-				request.method === "GET" ||
-				request.method === "HEAD" ||
-				request.method === "POST"
-			) {
-				// Handle requests to the API server
-				return handleRequest(request);
-			} else {
-				return new Response(null, {
-					status: 405,
-					statusText: "Method Not Allowed",
-				});
-			}
-		} else {
-			return rawHtmlResponse(DEMO_PAGE);
-		}
-	},
-} satisfies ExportedHandler;
+    return new Response(text, {
+      status: resp.status,
+      headers: {
+        "Content-Type": contentType,
+        ...CORS(env.ALLOW_ORIGIN || "*"),
+      },
+    });
+  }
+} satisfies ExportedHandler<Env>;
